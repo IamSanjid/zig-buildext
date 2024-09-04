@@ -5,6 +5,26 @@ pub const fluent = @import("fluent");
 
 pub fn build(_: *std.Build) void {}
 
+pub inline fn comptimeScalarReplace(
+    comptime str: anytype,
+    comptime fromScalar: u8,
+    comptime toScalar: u8,
+) *const [str.len:0]u8 {
+    comptime {
+        var buf: [str.len:0]u8 = undefined;
+        for (str, 0..) |c, j| {
+            if (c == fromScalar) {
+                buf[j] = toScalar;
+            } else {
+                buf[j] = c;
+            }
+        }
+        buf[buf.len] = 0;
+        const final = buf;
+        return &final;
+    }
+}
+
 pub fn getOs(target: std.Target) []const u8 {
     return @tagName(target.os.tag);
 }
