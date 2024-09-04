@@ -1,0 +1,15 @@
+.{
+    .name = "zig-buildext",
+    .version = "0.0.0",
+    .minimum_zig_version = "0.14.0-dev.1359+e9a00ba7f",
+    .dependencies = .{
+        .fluent = .{
+            .url = "git+https://github.com/IamSanjid/Fluent.git?ref=zig-build-pkg#0152049f27080658c6a564be6f8bf92f7f47c2dc",
+            .hash = "12207998d6b067f4e4ff08937c1998d88aaf5bd5db4a5b931a4e04efb1f12894c114",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+    },
+}
