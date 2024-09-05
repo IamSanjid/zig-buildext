@@ -25,6 +25,300 @@ pub inline fn comptimeScalarReplace(
     }
 }
 
+const desc_field_fmt = "__desc_{s}_desc__";
+fn DescriptionFieldName(comptime name: []const u8) *const [std.fmt.count(desc_field_fmt, .{name}):0]u8 {
+    return std.fmt.comptimePrint(desc_field_fmt, .{name});
+}
+
+fn isDescriptionFieldName(comptime name: []const u8) bool {
+    if (comptime std.mem.startsWith(u8, name, "__desc") and
+        std.mem.endsWith(u8, name, "_desc__"))
+    {
+        return true;
+    }
+    return false;
+}
+
+pub fn AsOptionalType(comptime T: type) type {
+    return @Type(.{ .optional = .{ .child = T } });
+}
+
+fn StructFieldDefaultValue(comptime sf: std.builtin.Type.StructField) *const sf.type {
+    const fi_type_dvalue = sf.default_value.?;
+    const fi_type_aligned: *align(sf.alignment) const anyopaque = @alignCast(fi_type_dvalue);
+    return @as(*const sf.type, @ptrCast(fi_type_aligned));
+}
+
+pub fn BuildOptionsType(comptime T: type) type {
+    const type_info = @typeInfo(T);
+    const StructField = std.builtin.Type.StructField;
+    if (type_info != .@"struct") {
+        @compileError("expected tuple or struct argument, found " ++ @typeName(T));
+    }
+    const fields_info = type_info.@"struct".fields;
+    comptime var new_fields: [fields_info.len * 2]StructField = undefined;
+
+    inline for (fields_info, 0..) |fi, idx| {
+        const i = idx * 2;
+        const fi_type_info = @typeInfo(fi.type);
+        if (fi_type_info != .@"struct") {
+            @compileError("expected field(" ++ fi.name ++ ") type to be a tuple or struct argument, found " ++ @typeName(T));
+        }
+
+        const fi_args = fi_type_info.@"struct".fields;
+        if ((fi_args.len != 2 and fi_args.len != 3) or !fi_type_info.@"struct".is_tuple) {
+            @compileError("provide argument as `.{ .option_name = .{ type, \"Description\" } }` or `.{ .option_name = .{ type, \"Description\", default_value } }`");
+        }
+
+        const fi_type = StructFieldDefaultValue(fi_args[0]).*;
+
+        if (fi_args.len == 3) {
+            const as_default_value: ?*const anyopaque = if (fi_args[2].default_value != null)
+                @ptrCast(&@as(fi_type, StructFieldDefaultValue(fi_args[2]).*))
+            else
+                null;
+            new_fields[i] = StructField{
+                .name = fi.name,
+                .type = fi_type,
+                .default_value = as_default_value,
+                .is_comptime = false,
+                .alignment = @alignOf(fi_type),
+            };
+        } else {
+            const NullType = if (@typeInfo(fi_type) == .optional)
+                fi_type
+            else
+                AsOptionalType(fi_type);
+            const null_value: NullType = null;
+            new_fields[i] = StructField{
+                .name = fi.name,
+                .type = NullType,
+                .default_value = @ptrCast(&null_value),
+                .is_comptime = false,
+                .alignment = @alignOf(NullType),
+            };
+        }
+        // description
+        new_fields[i + 1] = StructField{
+            .name = DescriptionFieldName(fi.name),
+            .type = fi_args[1].type,
+            .default_value = fi_args[1].default_value,
+            .is_comptime = fi_args[1].is_comptime,
+            .alignment = @alignOf(fi_args[1].type),
+        };
+    }
+
+    return @Type(.{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = new_fields[0..],
+            .decls = &.{},
+            .is_tuple = false,
+            .backing_integer = null,
+        },
+    });
+}
+
+pub fn BuildOptions(comptime args: anytype) type {
+    const ArgsType = if (@TypeOf(args) == type) args else @TypeOf(args);
+    const OptionsType = BuildOptionsType(ArgsType);
+    return struct {
+        pub const Type = OptionsType;
+        pub const RawType = ArgsType;
+        pub const DepArgsType = ToDepArgsType();
+
+        pub fn default() Type {
+            return CreateDefaultStruct(Type);
+        }
+
+        pub fn parse(b: *std.Build, fmt_prefix: []const u8, overrides: anytype) Type {
+            return parseBuildOptions(b, Type, fmt_prefix, overrides);
+        }
+
+        // Replaces '_' with '-' of the field names for proper "option name".
+        // So that `std.Build.dependency` can parse those as options.
+        pub fn toDependencyArgs(options: Type) DepArgsType {
+            var dep_options: DepArgsType = undefined;
+            inline for (@typeInfo(DepArgsType).@"struct".fields) |field| {
+                const field_name = comptimeScalarReplace(field.name, '-', '_');
+                @field(dep_options, field.name) = @field(options, field_name);
+            }
+            return dep_options;
+        }
+
+        fn ToDepArgsType() type {
+            const type_info = @typeInfo(Type);
+            const struct_info = type_info.@"struct";
+
+            // Don't need the "description fields"
+            comptime var fields: [struct_info.fields.len / 2]std.builtin.Type.StructField = undefined;
+            comptime var field_idx = 0;
+
+            inline for (type_info.@"struct".fields) |field| {
+                if (!isDescriptionFieldName(field.name)) {
+                    fields[field_idx] = field;
+                    fields[field_idx].name = comptimeScalarReplace(field.name, '_', '-');
+                    field_idx += 1;
+                }
+            }
+
+            return @Type(.{
+                .@"struct" = .{
+                    .layout = .auto,
+                    .fields = fields[0..],
+                    .decls = &.{},
+                    .is_tuple = false,
+                    .backing_integer = null,
+                },
+            });
+        }
+    };
+}
+
+pub fn CreateDefaultStruct(comptime T: type) T {
+    const type_info = @typeInfo(T);
+    if (type_info != .@"struct") {
+        @compileError("expected tuple or struct argument, found " ++ @typeName(T));
+    }
+    const fields_info = type_info.@"struct".fields;
+    var instance: T = undefined;
+
+    inline for (fields_info) |fi| {
+        if (fi.default_value) |dvalue| {
+            const dvalue_aligned: *align(fi.alignment) const anyopaque = @alignCast(dvalue);
+            const value = @as(*const fi.type, @ptrCast(dvalue_aligned)).*;
+            @field(instance, fi.name) = value;
+            //_ = dvalue;
+            //@field(instance, fi.name) = StructFieldDefaultValue(fi).*;
+        }
+    }
+
+    return instance;
+}
+
+pub fn parseImmidiateBuildOptions(
+    b: *std.Build,
+    imm_options: anytype,
+    fmt_prefix: []const u8,
+) BuildOptionsType(@TypeOf(imm_options)) {
+    const OptionsType = BuildOptions(@TypeOf(imm_options));
+    var instance: OptionsType.Type = undefined;
+
+    const imm_opt_field_infos = @typeInfo(OptionsType.RawType).@"struct".fields;
+    inline for (imm_opt_field_infos) |imm_fi| {
+        const has_default = @typeInfo(imm_fi.type).@"struct".fields.len == 3;
+        const fi_type = @TypeOf(@field(instance, imm_fi.name));
+        const fi_type_info = @typeInfo(fi_type);
+
+        const is_optional = fi_type_info == .optional;
+        const imm_option_type = if (is_optional)
+            fi_type_info.optional.child
+        else
+            fi_type;
+
+        // Could be a runtime option.
+        @field(instance, DescriptionFieldName(imm_fi.name)) = @field(imm_options, imm_fi.name)[1];
+        switch (imm_option_type) {
+            std.Build.ResolvedTarget => {
+                if (has_default) {
+                    @field(instance, imm_fi.name) = @field(imm_options, imm_fi.name)[2];
+                } else if (is_optional) {
+                    @field(instance, imm_fi.name) = b.standardTargetOptions(.{});
+                }
+            },
+            std.builtin.OptimizeMode => {
+                if (has_default) {
+                    @field(instance, imm_fi.name) = @field(imm_options, imm_fi.name)[2];
+                } else if (is_optional) {
+                    @field(instance, imm_fi.name) = b.standardOptimizeOption(.{});
+                }
+            },
+            else => {
+                if (b.option(
+                    imm_option_type,
+                    b.fmt("{s}{s}", .{ fmt_prefix, comptimeScalarReplace(imm_fi.name, '_', '-') }),
+                    @field(imm_options, imm_fi.name)[1],
+                )) |value| {
+                    @field(instance, imm_fi.name) = value;
+                } else if (has_default) {
+                    @field(instance, imm_fi.name) = @field(imm_options, imm_fi.name)[2];
+                }
+            },
+        }
+    }
+
+    return instance;
+}
+
+pub fn parseBuildOptions(
+    b: *std.Build,
+    comptime T: type,
+    fmt_prefix: []const u8,
+    overrides: anytype,
+) T {
+    const OverridesType = @TypeOf(overrides);
+    const overrides_type_info = @typeInfo(OverridesType);
+    if (overrides_type_info != .@"struct") {
+        @compileError("for overrides expected tuple or struct argument, found " ++ @typeName(OverridesType));
+    }
+    const args_type_info = @typeInfo(T);
+    var instance = CreateDefaultStruct(T);
+
+    const fields_info = args_type_info.@"struct".fields;
+    inline for (fields_info) |fi| {
+        const final_fi_type_info = @typeInfo(fi.type);
+
+        if (comptime isDescriptionFieldName(fi.name)) continue;
+
+        const is_optional = final_fi_type_info == .optional;
+        const fi_type = if (is_optional)
+            final_fi_type_info.optional.child
+        else
+            fi.type;
+
+        const option_name = comptimeScalarReplace(fi.name, '_', '-');
+        if (@hasField(OverridesType, fi.name)) {
+            @field(instance, fi.name) = @field(overrides, fi.name);
+        } else if (@hasField(OverridesType, option_name)) {
+            @field(instance, fi.name) = @field(overrides, option_name);
+        } else {
+            switch (fi_type) {
+                std.Build.ResolvedTarget => {
+                    if (is_optional) {
+                        @field(instance, fi.name) = b.standardTargetOptions(.{});
+                    }
+                },
+                std.builtin.OptimizeMode => {
+                    if (is_optional) {
+                        @field(instance, fi.name) = b.standardOptimizeOption(.{});
+                    }
+                },
+                else => {
+                    if (@hasField(T, DescriptionFieldName(fi.name))) {
+                        if (b.option(
+                            fi_type,
+                            b.fmt("{s}{s}", .{ fmt_prefix, option_name }),
+                            @field(instance, DescriptionFieldName(fi.name)),
+                        )) |value| {
+                            @field(instance, fi.name) = value;
+                        }
+                    } else {
+                        if (b.option(
+                            fi_type,
+                            b.fmt("{s}{s}", .{ fmt_prefix, option_name }),
+                            "",
+                        )) |value| {
+                            @field(instance, fi.name) = value;
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    return instance;
+}
+
 pub fn getOs(target: std.Target) []const u8 {
     return @tagName(target.os.tag);
 }
