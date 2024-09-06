@@ -4,8 +4,8 @@
     .minimum_zig_version = "0.14.0-dev.1359+e9a00ba7f",
     .dependencies = .{
         .fluent = .{
-            .url = "git+https://github.com/IamSanjid/Fluent.git?ref=zig-build-pkg#3fcf4a7597526dea0232fb0823550ab545e486ae",
-            .hash = "12203b04672a2a98890481430803307e7f621933d3b58a5bc93e22258875606601ef",
+            .url = "git+https://github.com/IamSanjid/Fluent.git?ref=zig-build-pkg#09313c806ef35e2c0b2863ff270c387dd5c0c2db",
+            .hash = "12207d486f3d1958358e8382beb7eeca9c2a45edd795f2c34b8b2000fbea78db6cd5",
         },
     },
     .paths = .{
