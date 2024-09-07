@@ -389,6 +389,22 @@ pub fn getNativePaths(
                 "x64",
             };
 
+            fn checkAddLibDir(
+                self: *@This(),
+                parent_abs_path: []const u8,
+                current_dir_name: []const u8,
+                possible_dir_name: []const u8,
+            ) void {
+                const full_path = std.fs.path.join(self.allocator, &.{
+                    parent_abs_path,
+                    current_dir_name,
+                    possible_dir_name,
+                }) catch @panic("OOM");
+                std.fs.accessAbsolute(full_path, .{}) catch return;
+                // btw `NativePaths.addLibDir` doesn't copy the path, arena allocator
+                self.nps.addLibDir(full_path) catch @panic("OOM");
+            }
+
             fn searchAndAddLibDirs(self: *@This(), dir: std.fs.Dir) !void {
                 const dir_path = try dir.realpathAlloc(self.allocator, "");
                 if (std.mem.indexOf(u8, dir_path, tools_msvc_part) != null) return;
@@ -420,10 +436,13 @@ pub fn getNativePaths(
 
                     if (found_lib_dir) {
                         if (std.ascii.indexOfIgnoreCase(dir_path, arch_dir) == null and !is_x86) {
-                            try self.nps.addLibDir(try std.fs.path.join(self.allocator, &.{ dir_path, file.name, arch_dir }));
-                            try self.nps.addLibDir(try std.fs.path.join(self.allocator, &.{ dir_path, arch_dir, file.name }));
+                            self.checkAddLibDir(dir_path, file.name, arch_dir);
+                            self.checkAddLibDir(dir_path, arch_dir, file.name);
                         } else {
-                            try self.nps.addLibDir(try std.fs.path.join(self.allocator, &.{ dir_path, file.name }));
+                            self.nps.addLibDir(std.fs.path.join(self.allocator, &.{
+                                dir_path,
+                                file.name,
+                            }) catch @panic("OOM")) catch @panic("OOM");
                         }
                     } else {
                         var new_dir = try dir.openDir(file.name, .{
@@ -435,6 +454,7 @@ pub fn getNativePaths(
                     }
                 }
             }
+
             // over engineered ikr but was having fun...
             fn setTargetArch(self: *@This(), target_arch: std.Target.Cpu.Arch) !void {
                 self.target_arch = target_arch;
@@ -490,7 +510,9 @@ pub fn getNativePaths(
 
         if (libc_installation.msvc_lib_dir) |msvc_lib_dir| {
             try native_paths.addLibDir(msvc_lib_dir);
-            // add every lib path TOOLS
+            // add all the possible libs path of
+            // C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\**
+            // if the visual studio environment is set the linker will be able to find those..
             addMSVCToolsLibDirs.perform(msvc_lib_dir) catch {};
         }
 
@@ -528,6 +550,21 @@ pub fn getObjSystemPath(
     return error.FileNotFound;
 }
 
+const extensions_pattern = "(\\.so|\\.a|\\.dylib|\\.tbd|\\.lib|.\\.dll.a)";
+const linkage_static_extensions = std.StaticStringMap(void).initComptime(&.{
+    .{"a"},
+    .{"lib"},
+    .{"dll.a"},
+});
+const linkage_dynamic_extensions = std.StaticStringMap(void).initComptime(&.{
+    .{"so"},
+    .{"dylib"},
+    .{"tbd"},
+    .{"lib"},
+    .{"dll.a"},
+});
+
+// links specific libs inside of a directory...
 pub fn linkLibsOf(
     module: *std.Build.Module,
     libs_path: std.Build.LazyPath,
@@ -547,19 +584,16 @@ pub fn linkLibsOf(
     const target = module.resolved_target.?.result;
     module.addLibraryPath(libs_path);
 
-    const is_windows = target.os.tag == .windows;
-    const possible_lib_prefix = "lib";
-    const lib_prefix = if (target.isMinGW() and linkage_static) "lib" else target.libPrefix();
-    const lib_suffixes: []const []const u8 = if (linkage_static)
-        &.{ ".lib", ".a", ".dll.a" }
-    else
-        &.{ ".lib", ".so", ".dylib", ".dll.a" };
-
     var libs_set = std.StringHashMap(void).init(b.allocator);
     defer libs_set.deinit();
     for (libs) |lib| {
         libs_set.put(lib, {}) catch @panic("OOM");
     }
+
+    const is_windows = target.os.tag == .windows;
+    const possible_lib_prefix = "lib";
+    const lib_prefix = if (target.isMinGW() and linkage_static) "lib" else target.libPrefix();
+    const lib_suffixes = if (linkage_static) linkage_static_extensions else linkage_dynamic_extensions;
 
     var lib_files = dir.iterate();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -577,20 +611,14 @@ pub fn linkLibsOf(
 
         var link_strat: enum { skip, auto, absolute } = .skip;
         var lib_name: []const u8 = entry.name;
-        for (lib_suffixes) |suffix| {
-            if (std.mem.endsWith(u8, lib_name, suffix)) {
-                lib_name = lib_name[0..(lib_name.len - suffix.len)];
+        var matches = fluent.match(extensions_pattern, lib_name);
+        if (matches.next()) |match| {
+            // skipping the starting `.`, `extensions_pattern` supposed to match the `.`
+            if (lib_suffixes.has(match.items[1..])) {
+                // TODO: we probably can get the pos from Fluent.
+                const pos = std.mem.indexOf(u8, lib_name, match.items).?;
+                lib_name = lib_name[0..pos];
                 link_strat = .auto;
-                break;
-            }
-        }
-
-        if (link_strat == .skip) {
-            if (std.mem.indexOf(u8, lib_name, ".so.")) |pos| {
-                if (pos > 0) {
-                    lib_name = lib_name[0..pos];
-                    link_strat = .absolute;
-                }
             }
         }
 
@@ -601,14 +629,14 @@ pub fn linkLibsOf(
                 link_strat = .absolute;
             }
         }
+
         check_set: {
             if (!libs_set.contains(entry.name) and !libs_set.contains(lib_name)) {
-                if (link_strat != .skip and is_windows and lib_prefix.len == 0 and
-                    std.mem.startsWith(u8, lib_name, possible_lib_prefix))
+                if (link_strat != .skip and target.abi == .msvc and
+                    std.mem.startsWith(u8, lib_name, possible_lib_prefix) and
+                    libs_set.contains(lib_name[possible_lib_prefix.len..]))
                 {
-                    if (libs_set.contains(lib_name[possible_lib_prefix.len..])) {
-                        break :check_set;
-                    }
+                    break :check_set;
                 }
                 continue;
             }
@@ -629,15 +657,16 @@ pub fn linkLibsOf(
     }
 }
 
+// links all the libs except some of a directory...
 pub fn linkAllLibsOf(
-    comp: *std.Build.Step.Compile,
+    module: *std.Build.Module,
     libs_path: std.Build.LazyPath,
     linkage_static: bool,
     read_symlink: bool,
     exclude_files: ?[]const []const u8,
 ) !void {
-    const b = comp.step.owner;
-    var dir = libs_path.getPath3(b, &comp.step).openDir("", .{
+    const b = module.owner;
+    var dir = libs_path.getPath3(b, null).openDir("", .{
         .iterate = true,
         .no_follow = true,
     }) catch |err| {
@@ -646,17 +675,24 @@ pub fn linkAllLibsOf(
     };
     defer dir.close();
 
-    const target = comp.rootModuleTarget();
+    var exclude_set = std.StringHashMap(void).init(b.allocator);
+    defer exclude_set.deinit();
+    if (exclude_files) |efs| {
+        for (efs) |exc_file| {
+            exclude_set.put(exc_file, {}) catch @panic("OOM");
+        }
+    }
+
+    const target = module.resolved_target.?.result;
+    module.addLibraryPath(libs_path);
+
     const is_windows = target.os.tag == .windows;
     const lib_prefix = if (target.isMinGW() and linkage_static) "lib" else target.libPrefix();
-    const lib_suffixes: []const []const u8 = if (linkage_static)
-        &.{ ".lib", ".a", ".dll.a" }
-    else
-        &.{ ".lib", ".so", ".dylib", ".dll.a" };
+    const lib_suffixes = if (linkage_static) linkage_static_extensions else linkage_dynamic_extensions;
 
     var lib_files = dir.iterate();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    outer_loop: while (lib_files.next() catch |err| {
+    while (lib_files.next() catch |err| {
         std.log.warn("Can't link libs of \"{s}\": {}", .{ libs_path.getPath(b), err });
         return;
     }) |entry| {
@@ -670,20 +706,14 @@ pub fn linkAllLibsOf(
 
         var link_strat: enum { skip, auto, absolute } = .skip;
         var lib_name: []const u8 = entry.name;
-        for (lib_suffixes) |suffix| {
-            if (std.mem.endsWith(u8, lib_name, suffix)) {
-                lib_name = lib_name[0..(lib_name.len - suffix.len)];
+        var matches = fluent.match(extensions_pattern, lib_name);
+        if (matches.next()) |match| {
+            // skipping the starting `.`, `extensions_pattern` supposed to match the `.`
+            if (lib_suffixes.has(match.items[1..])) {
+                // TODO: we probably can get the pos from Fluent.
+                const pos = std.mem.indexOf(u8, lib_name, match.items).?;
+                lib_name = lib_name[0..pos];
                 link_strat = .auto;
-                break;
-            }
-        }
-
-        if (link_strat == .skip) {
-            if (std.mem.indexOf(u8, lib_name, ".so.")) |pos| {
-                if (pos > 0) {
-                    lib_name = lib_name[0..pos];
-                    link_strat = .absolute;
-                }
             }
         }
 
@@ -695,19 +725,9 @@ pub fn linkAllLibsOf(
             }
         }
 
-        if (exclude_files) |efs| {
-            for (efs) |exc_file| {
-                if (std.mem.eql(u8, exc_file, entry.name) or
-                    std.mem.eql(u8, exc_file, lib_name))
-                {
-                    continue :outer_loop;
-                }
-            }
-        }
-
         switch (link_strat) {
-            .absolute => comp.addObjectFile(libs_path.path(b, entry.name)),
-            .auto => comp.linkSystemLibrary(lib_name),
+            .absolute => module.addObjectFile(libs_path.path(b, entry.name)),
+            .auto => module.linkSystemLibrary(lib_name, .{}),
             .skip => {
                 if (is_windows and std.mem.endsWith(u8, entry.name, ".dll")) {
                     const dll_path = libs_path.path(b, entry.name);
